@@ -45,6 +45,17 @@ app.post("/pix", async (req, res) => {
       },
       requestOptions: { idempotencyKey },
     });
+    const status = result?.status;
+const statusDetail = result?.status_detail;
+
+if (status !== "pending") {
+  return res.status(400).json({
+    error: "Pagamento não ficou pendente (não dá pra pagar esse QR).",
+    status,
+    status_detail: statusDetail,
+    payment_id: result?.id ?? null,
+  });
+}
 
     const tx = result?.point_of_interaction?.transaction_data;
 
@@ -60,6 +71,15 @@ app.post("/pix", async (req, res) => {
     const details = err?.cause || err?.response?.data || err?.message || err;
     console.error("MP ERROR:", status, details);
     res.status(status).json({ error: "Erro ao gerar PIX", status, details });
+  }
+});
+app.get("/payment/:id", async (req, res) => {
+  try {
+    const payment = new Payment(client);
+    const result = await payment.get({ id: req.params.id });
+    res.json({ id: result?.id, status: result?.status, status_detail: result?.status_detail });
+  } catch (e) {
+    res.status(500).json({ error: "Falha ao consultar pagamento", details: e?.message || e });
   }
 });
 
