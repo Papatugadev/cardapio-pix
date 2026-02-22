@@ -1,0 +1,10 @@
+{
+  "name": "mp-server",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "express": "^4.18.2",
+    "mercadopago": "^2.0.15",
+    "cors": "^2.8.5"
+  }
+}
