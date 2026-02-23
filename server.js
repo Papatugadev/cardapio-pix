@@ -6,22 +6,19 @@ import { MercadoPagoConfig, Payment } from "mercadopago";
 import admin from "firebase-admin";
 
 const app = express();
-
-// ===== CORS (libera geral) =====
-// Se quiser travar depois, eu te passo como liberar só seu domínio da Vercel.
 app.use(cors());
 app.use(express.json());
 
 // ===== Mercado Pago =====
 const accessToken = process.env.MP_ACCESS_TOKEN;
 if (!accessToken) {
-  console.error("Faltou MP_ACCESS_TOKEN no Render (NÃO coloque no GitHub).");
+  console.error("Faltou MP_ACCESS_TOKEN no Render.");
   process.exit(1);
 }
-const mpClient = new MercadoPagoConfig({ accessToken });
-const paymentApi = new Payment(mpClient);
+const mp = new MercadoPagoConfig({ accessToken });
+const paymentApi = new Payment(mp);
 
-// ===== Webhook Secret =====
+// ===== Webhook Secret (segurança) =====
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "";
 if (!WEBHOOK_SECRET) {
   console.warn("AVISO: WEBHOOK_SECRET não definido (recomendado definir no Render).");
@@ -56,7 +53,7 @@ app.get("/", (req, res) => {
 
 /**
  * POST /pix
- * body: { total, description, payerName, payerPhone, orderId }
+ * body: { total, description, payerName, payerPhone, orderId, rid }
  * retorna: { payment_id, status, qr_code, qr_code_base64, date_of_expiration }
  */
 app.post("/pix", async (req, res) => {
@@ -64,11 +61,13 @@ app.post("/pix", async (req, res) => {
     const total = Number(req.body?.total);
     const description = String(req.body?.description || "Pedido Restaurante");
 
-    const orderId = String(req.body?.orderId || "").trim();
+    const orderId = String(req.body?.orderId || "").trim(); // obrigatório
+    const rid = String(req.body?.rid || "").trim(); // 🔥 obrigatório no multi-restaurante
+
     const payerName = String(req.body?.payerName || "").trim();
     const payerPhone = String(req.body?.payerPhone || "").replace(/\D/g, "");
 
-    // email único pra evitar bloqueio por “robô”
+    // email único
     const payerEmail = `cliente${Date.now()}@pedido.com`;
 
     if (!Number.isFinite(total) || total <= 0) {
@@ -76,6 +75,9 @@ app.post("/pix", async (req, res) => {
     }
     if (!orderId) {
       return res.status(400).json({ error: "orderId é obrigatório" });
+    }
+    if (!rid) {
+      return res.status(400).json({ error: "rid é obrigatório (multi-restaurante)" });
     }
 
     const idempotencyKey = crypto.randomUUID();
@@ -86,7 +88,16 @@ app.post("/pix", async (req, res) => {
         transaction_amount: Number(total.toFixed(2)),
         description,
         payment_method_id: "pix",
-        external_reference: orderId, // linka pagamento ao pedido
+
+        // ✅ mantém compat com seu webhook antigo
+        external_reference: orderId,
+
+        // ✅ AQUI vai o rid (fonte da verdade pro webhook)
+        metadata: {
+          rid,
+          orderId,
+        },
+
         payer: {
           email: payerEmail,
           first_name: payerName ? payerName.split(" ")[0] : undefined,
@@ -103,7 +114,6 @@ app.post("/pix", async (req, res) => {
     const status = result?.status;
     const statusDetail = result?.status_detail;
 
-    // Se não ficou pending, NÃO devolve QR “morto”
     if (status !== "pending") {
       return res.status(400).json({
         error: "Pagamento não ficou pendente (não dá pra pagar esse QR).",
@@ -113,41 +123,59 @@ app.post("/pix", async (req, res) => {
       });
     }
 
+    // ✅ paymentId certo
     const paymentId = String(result?.id || "");
 
-    // salva no Firestore (orders)
-    await db.collection("orders").doc(orderId).set(
-      {
-        mp: {
-          payment_id: paymentId,
-          status,
-          status_detail: statusDetail || null,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
+    const mpData = {
+      payment_id: paymentId,
+      status,
+      status_detail: statusDetail || null,
+      rid,
+      orderId,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    // ✅ Atualiza no caminho CERTO (multi-restaurante)
+    const batch = db.batch();
+
+    const privRef = db.collection("restaurants").doc(rid).collection("orders").doc(orderId);
+    const pubRef = db.collection("restaurants").doc(rid).collection("orders_public").doc(orderId);
+
+    batch.set(
+      privRef,
+      { mp: mpData, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
       { merge: true }
     );
 
-    // salva no Firestore (orders_public)
-    await db.collection("orders_public").doc(orderId).set(
-      {
-        mp: {
-          payment_id: paymentId,
-          status,
-          status_detail: statusDetail || null,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
+    batch.set(
+      pubRef,
+      { mp: mpData, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
       { merge: true }
     );
+
+    // ✅ (Opcional) compat com seu modelo antigo (raiz)
+    const legacyPriv = db.collection("orders").doc(orderId);
+    const legacyPub = db.collection("orders_public").doc(orderId);
+
+    batch.set(
+      legacyPriv,
+      { mp: mpData, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+      { merge: true }
+    );
+
+    batch.set(
+      legacyPub,
+      { mp: mpData, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+      { merge: true }
+    );
+
+    await batch.commit();
 
     const tx = result?.point_of_interaction?.transaction_data;
 
     return res.json({
-      payment_id: paymentId,
-      status: status ?? null,
+      payment_id: result?.id ?? null,
+      status: result?.status ?? null,
       date_of_expiration: result?.date_of_expiration ?? null,
       qr_code: tx?.qr_code ?? "",
       qr_code_base64: tx?.qr_code_base64 ?? "",
@@ -162,12 +190,10 @@ app.post("/pix", async (req, res) => {
 
 /**
  * Webhook Mercado Pago
- * URL no MP:
- * https://SEU-RENDER.onrender.com/webhook/mercadopago?secret=SEU_WEBHOOK_SECRET
+ * URL: https://SEU-RENDER.onrender.com/webhook/mercadopago?secret=SEU_WEBHOOK_SECRET
  */
 app.post("/webhook/mercadopago", async (req, res) => {
   try {
-    // segurança simples por querystring
     if (WEBHOOK_SECRET) {
       const secret = String(req.query?.secret || "");
       if (secret !== WEBHOOK_SECRET) {
@@ -175,34 +201,43 @@ app.post("/webhook/mercadopago", async (req, res) => {
       }
     }
 
-    // MP costuma mandar: { type: "payment", data: { id: "123" } }
-    const paymentId = String(req.body?.data?.id || req.body?.id || "");
-    if (!paymentId) {
-      return res.status(200).json({ ok: true, ignored: "no payment id" });
-    }
+    const paymentId = String(req.body?.data?.id || req.body?.id || "").trim();
+    if (!paymentId) return res.status(200).json({ ok: true, ignored: "no payment id" });
 
-    // Consulta pagamento real (fonte da verdade)
+    // fonte da verdade
     const p = await paymentApi.get({ id: paymentId });
 
     const status = String(p?.status || "");
     const statusDetail = String(p?.status_detail || "");
-    const orderId = String(p?.external_reference || "").trim();
 
-    if (!orderId) {
-      return res.status(200).json({ ok: true, ignored: "no external_reference" });
+    // ✅ pega rid do metadata (principal)
+    const rid = String(p?.metadata?.rid || "").trim();
+
+    // ✅ orderId pode vir do metadata ou external_reference
+    const orderId = String(p?.metadata?.orderId || p?.external_reference || "").trim();
+
+    if (!rid || !orderId) {
+      return res.status(200).json({
+        ok: true,
+        ignored: "missing rid/orderId",
+        rid,
+        orderId,
+      });
     }
 
     const mpData = {
       payment_id: String(p?.id || paymentId),
       status,
       status_detail: statusDetail || null,
+      rid,
+      orderId,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
     const batch = db.batch();
 
-    const orderRef = db.collection("orders").doc(orderId);
-    const pubRef = db.collection("orders_public").doc(orderId);
+    const privRef = db.collection("restaurants").doc(rid).collection("orders").doc(orderId);
+    const pubRef = db.collection("restaurants").doc(rid).collection("orders_public").doc(orderId);
 
     const baseUpdate = {
       mp: mpData,
@@ -211,30 +246,58 @@ app.post("/webhook/mercadopago", async (req, res) => {
 
     if (status === "approved") {
       batch.set(
-        orderRef,
-        { ...baseUpdate, status: "em_preparo", paidAt: admin.firestore.FieldValue.serverTimestamp() },
+        privRef,
+        {
+          ...baseUpdate,
+          status: "em_preparo",
+          paidAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
         { merge: true }
       );
       batch.set(
         pubRef,
+        {
+          ...baseUpdate,
+          status: "em_preparo",
+          paidAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    } else {
+      batch.set(privRef, baseUpdate, { merge: true });
+      batch.set(pubRef, baseUpdate, { merge: true });
+    }
+
+    // ✅ (Opcional) compat com coleção raiz
+    const legacyPriv = db.collection("orders").doc(orderId);
+    const legacyPub = db.collection("orders_public").doc(orderId);
+
+    if (status === "approved") {
+      batch.set(
+        legacyPriv,
+        { ...baseUpdate, status: "em_preparo", paidAt: admin.firestore.FieldValue.serverTimestamp() },
+        { merge: true }
+      );
+      batch.set(
+        legacyPub,
         { ...baseUpdate, status: "em_preparo", paidAt: admin.firestore.FieldValue.serverTimestamp() },
         { merge: true }
       );
     } else {
-      batch.set(orderRef, baseUpdate, { merge: true });
-      batch.set(pubRef, baseUpdate, { merge: true });
+      batch.set(legacyPriv, baseUpdate, { merge: true });
+      batch.set(legacyPub, baseUpdate, { merge: true });
     }
 
     await batch.commit();
+
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("WEBHOOK ERROR:", err?.message || err);
-    // Mercado Pago pode retentar; retornamos 200 para não ficar em loop de erro
     return res.status(200).json({ ok: true });
   }
 });
 
-// Debug: consultar pagamento
+// Debug opcional
 app.get("/payment/:id", async (req, res) => {
   try {
     const result = await paymentApi.get({ id: req.params.id });
@@ -243,11 +306,11 @@ app.get("/payment/:id", async (req, res) => {
       status: result?.status ?? null,
       status_detail: result?.status_detail ?? null,
       external_reference: result?.external_reference ?? null,
+      metadata: result?.metadata ?? null,
     });
   } catch (e) {
     const status = e?.status || e?.response?.status || 500;
     const details = e?.cause || e?.response?.data || e?.message || e;
-    console.error("MP GET ERROR:", status, details);
     return res.status(status).json({ error: "Falha ao consultar pagamento", status, details });
   }
 });
