@@ -3,6 +3,7 @@ import cors from "cors";
 import "dotenv/config";
 import crypto from "crypto";
 import { MercadoPagoConfig, Payment } from "mercadopago";
+import admin from "firebase-admin";
 
 
 const app = express();
